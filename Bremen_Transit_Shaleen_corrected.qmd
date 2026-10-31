@@ -1,0 +1,1268 @@
+
+---
+title: "Bremen Transit: Understanding Recurring Delays"
+subtitle: "Where delays occur, when they persist, and what BSAG can do"
+
+author:
+  - name: "Shaleen Debeila"
+  - name: "Lutendo Boitumelo Mulea"
+  - name: "Rebeccah Chepkemoi Kapsekei"
+  - name: "Limpo Shawa"
+  - name: "Desree Mmaphuti Matlala"
+
+date: "2026-10-30"
+date-format: "D MMMM YYYY"
+
+abstract: |
+  This study investigates recurring delays in Bremen's bus and tram
+  network using GTFS real-time data collected between 17 and 31 August
+  2026. We examine where delays occur, when they are most frequent,
+  and whether they persist across multiple days.
+
+  The analysis combines and cleans real-time transit observations,
+  removes duplicate records, and examines delay patterns across
+  stops, routes, and time periods. Particular attention is given
+  to recurring delay hotspots, including Stellfeldsweg, and to
+  changes in data coverage that may affect the interpretation
+  of service reliability.
+
+  Based on these findings, the study evaluates possible explanations
+  for recurring delays and proposes targeted recommendations for
+  BSAG. Potential causes are distinguished from confirmed findings
+  to ensure that conclusions remain supported by the evidence.
+
+format:
+  html:
+    theme: cosmo
+    toc: true
+    toc-depth: 3
+    toc-location: left
+    number-sections: true
+    code-fold: true
+    code-tools: true
+    embed-resources: true
+    fig-width: 8
+    fig-height: 5
+    output-file: index.html
+
+execute:
+  echo: false
+  warning: false
+  message: false
+---
+
+
+```{r}
+#| label: setup
+#| code-summary: "Setup and configuration"
+
+library(tidyverse)
+library(lubridate)
+library(scales)
+library(knitr)
+
+# ---- Configuration ------------------------------------------------------
+
+DATA_DIR <- "update_data"
+LOOKUP_FILE <- "bremen_lookup.csv"
+CACHE_FILE <- "data_processed/prep.rds"
+
+
+TS_IS_UTC    <- FALSE   # set after reading the timezone check (Data quality)
+LATE_SEC     <- 300     # "significantly delayed" = 5 minutes or more
+EXTREME_SEC  <- 3600    # observations beyond +/- 1 hour are excluded
+MIN_TRIPS    <- 200     # minimum observations before a stop/route is ranked
+
+CASE_STOP_NAME <- "Bremen Stellfeldsweg"  # case-study stop; its stop_id(s) are looked up
+N_PRIORITY     <- 3     # top persistent stops (by name) treated as priority stops
+MIN_TRIPS_DAY  <- 20    # minimum trips in a stop-day for the persistence measure
+DAY_CUTOFF     <- 20    # a "bad day" = at least this % of trips 5+ min late
+SPLIT_DATE   <- as.Date("2026-08-22")
+LINE_FOR_PROFILE <- "61"
+RUN_ROUTE_INFERENCE <- FALSE   # TRUE = slow, optional (Problem routes)
+
+# ---- Helpers ------------------------------------------------------------
+theme_set(theme_minimal(base_size = 12))
+
+pct <- function(x, digits = 1) paste0(formatC(x, format = "f", digits = digits), "%")
+
+wilson_lo <- function(x, n, z = 1.96) {
+  p <- x / n; d <- 1 + z^2 / n
+  (p + z^2 / (2 * n) - z * sqrt(p * (1 - p) / n + z^2 / (4 * n^2))) / d
+}
+wilson_hi <- function(x, n, z = 1.96) {
+  p <- x / n; d <- 1 + z^2 / n
+  (p + z^2 / (2 * n) + z * sqrt(p * (1 - p) / n + z^2 / (4 * n^2))) / d
+}
+
+# Share of observations delayed >= LATE_SEC with a 95% Wilson interval
+summarise_delays <- function(df, ...) {
+  df |>
+    group_by(...) |>
+    summarise(
+      trips            = n(),
+      late             = sum(delay_seconds >= LATE_SEC),
+      pct_late         = 100 * late / trips,
+      ci_low           = 100 * wilson_lo(late, trips),
+      ci_high          = 100 * wilson_hi(late, trips),
+      mean_delay_min   = mean(delay_seconds) / 60,
+      median_delay_min = median(delay_seconds) / 60,
+      .groups = "drop"
+    )
+}
+```
+
+```{r}
+#| label: prep
+#| code-summary: "Load, clean and de-duplicate the data (cached after the first run)"
+
+# Check project-relative inputs before using an existing cache.
+if (!dir.exists(DATA_DIR)) stop("Transit snapshot folder not found: ", DATA_DIR)
+if (!file.exists(LOOKUP_FILE)) stop("Stop lookup file not found: ", LOOKUP_FILE)
+files <- list.files(DATA_DIR, pattern = "\\.csv$", full.names = TRUE)
+if (length(files) == 0) stop("No CSV snapshots found in: ", DATA_DIR)
+
+# Cache validity includes file names, sizes and modification times, so it
+# rebuilds when the source data change.
+file_meta <- file.info(files)
+cfg <- list(TS_IS_UTC = TS_IS_UTC, EXTREME_SEC = EXTREME_SEC,
+            source_files = basename(files),
+            source_sizes = unname(file_meta$size),
+            source_mtimes = as.numeric(file_meta$mtime),
+            lookup_size = unname(file.info(LOOKUP_FILE)$size),
+            lookup_mtime = as.numeric(file.info(LOOKUP_FILE)$mtime))
+dir.create(dirname(CACHE_FILE), showWarnings = FALSE, recursive = TRUE)
+
+prep <- if (file.exists(CACHE_FILE)) tryCatch(readRDS(CACHE_FILE), error = function(e) NULL) else NULL
+
+if (is.null(prep) || !identical(prep$cfg, cfg)) {
+  # First run (or settings changed): takes a few minutes.
+  raw    <- purrr::map_dfr(files, ~ readr::read_csv(.x, show_col_types = FALSE))
+  lookup <- read_csv(LOOKUP_FILE, show_col_types = FALSE) |>
+    mutate(stop_id = as.character(stop_id))
+  raw <- raw |> mutate(stop_id = as.character(stop_id))
+
+  if (nrow(raw) == 0) stop("CSV files contain no observations")
+  uniq  <- distinct(raw)
+  clean <- uniq |> filter(!is.na(delay_seconds),
+                          between(delay_seconds, -EXTREME_SEC, EXTREME_SEC),
+                          !is.na(timestamp_fetched), !is.na(trip_id), !is.na(stop_id))
+
+  if (nrow(clean) == 0) stop("No usable rows remain after cleaning")
+
+  # Hour counts under two assumptions about the stored timestamps
+  tz_counts <- bind_rows(
+    clean |> count(hour = hour(timestamp_fetched)) |>
+      mutate(assumption = "Timestamps are local (as stored)"),
+    clean |>
+      count(hour = hour(with_tz(force_tz(timestamp_fetched, "UTC"),
+                                "Europe/Berlin"))) |>
+      mutate(assumption = "Timestamps are UTC (converted)")
+  )
+
+  to_local <- function(x) {
+    if (TS_IS_UTC) with_tz(force_tz(x, "UTC"), "Europe/Berlin") else x
+  }
+
+  stop_lookup <- lookup |>
+    distinct(stop_id, stop_name, stop_lat, stop_lon) |>
+    distinct(stop_id, .keep_all = TRUE)
+
+  # One observation per trip x stop x date: the LAST snapshot (closest to the
+  # actual passing time). Max and mean are kept for a sensitivity check.
+  tu <- clean |>
+    mutate(ts_local   = to_local(timestamp_fetched),
+           local_date = as.Date(format(ts_local, "%Y-%m-%d"))) |>
+    arrange(ts_local) |>
+    group_by(local_date, trip_id, stop_id) |>
+    summarise(
+      snapshots  = n(),
+      ts_last    = last(ts_local),
+      delay_last = last(delay_seconds),
+      delay_max  = max(delay_seconds),
+      delay_mean = mean(delay_seconds),
+      .groups = "drop"
+    ) |>
+    mutate(
+      delay_seconds = delay_last,
+      local_hour    = hour(ts_last),
+      dow           = wday(local_date, label = TRUE, week_start = 1)
+    ) |>
+    left_join(stop_lookup, by = "stop_id")
+
+  single_route_stops <- lookup |>
+    distinct(stop_id, route_short_name, route_type) |>
+    group_by(stop_id) |>
+    filter(n_distinct(route_short_name, na.rm = TRUE) == 1) |>
+    ungroup() |>
+    distinct(stop_id, .keep_all = TRUE)
+
+  stats <- tibble(
+    stage = c("Snapshot files read",
+              "Rows read (all files)",
+              "After removing exact duplicate rows",
+              "After removing observations beyond ±1 hour",
+              "Unique trip × stop × date observations (analysis dataset)"),
+    count = c(length(files), nrow(raw), nrow(uniq), nrow(clean), nrow(tu))
+  )
+
+  prep <- list(cfg = cfg, tu = tu, lookup = lookup, stop_lookup = stop_lookup,
+               single_route_stops = single_route_stops, stats = stats,
+               tz_counts = tz_counts, ts_range = range(raw$timestamp_fetched),
+               n_unmatched = sum(is.na(tu$stop_name)))
+  saveRDS(prep, CACHE_FILE)
+  rm(raw, uniq, clean); gc()
+}
+
+tu                 <- prep$tu
+lookup             <- prep$lookup
+stop_lookup        <- prep$stop_lookup
+single_route_stops <- prep$single_route_stops
+stats              <- prep$stats
+tz_counts          <- prep$tz_counts
+```
+
+```{r}
+#| label: core-results
+#| include: false
+
+overall   <- tu |> summarise_delays()
+stop_rank <- tu |>
+  filter(!is.na(stop_name)) |>
+  summarise_delays(stop_id, stop_name, stop_lat, stop_lon) |>
+  filter(trips >= MIN_TRIPS) |>
+  arrange(desc(ci_low))
+top3 <- stop_rank |> slice_head(n = 3) |> pull(stop_name) |>
+  str_remove("^Bremen ")
+
+# Case-study stop: looked up by name, never typed as an ID
+CASE_STOP_IDS <- stop_lookup |> filter(stop_name == CASE_STOP_NAME) |> pull(stop_id)
+stopifnot(length(CASE_STOP_IDS) > 0)
+```
+
+# Summary
+
+- We analysed **`r comma(overall$trips)`** trip-stop observations from
+  **`r comma(stats$count[1])`** snapshot CSV files collected between
+  `r format(prep$ts_range[1], "%d %b %Y")` and `r format(prep$ts_range[2], "%d %b %Y")`.
+- **`r pct(overall$pct_late)`** of observations were 5 minutes or more behind
+  schedule; the median delay was **`r round(overall$median_delay_min, 1)` minutes**.
+- Ranked by the conservative end of a 95% confidence interval, the stops with
+  the highest share of significant delays were **`r paste(top3, collapse = ", ")`**
+  (@sec-stops).
+- **Coverage caution:** At Stellfeldsweg, recorded observations fell from approximately 680 per day before 23 August to fewer than 25 per day afterwards, while observations elsewhere in the network increased. The late-period estimate of 5.7% delayed rests on only 88 observations; this is more consistent with a possible coverage gap than firm evidence of improved service.
+
+The subsequent sections examine whether these delays are concentrated by route,
+time of day and day of the week. A detailed stop-level case study considers
+Stellfeldsweg. The analysis identifies patterns rather than proving the
+operational causes of individual delays.
+
+# Background and research question
+
+Bremen's public transport operator (BSAG) publishes real-time delay estimates
+for its trams and buses through the GTFS real-time feed
+([gtfs.de](https://gtfs.de/de/realtime/)). Commuters experience delays as
+recurring bottlenecks, but a feed of five-minute snapshots does not show them
+directly.
+
+**Our questions**
+
+1. Which stops and routes are *chronically* delayed?
+2. When do delays occur (time of day, weekday)?
+3. What might explain them?
+4. What could BSAG or the city do about it?
+
+Repeated delays matter because passengers depend on predictable arrival and
+transfer times. This investigation therefore prioritizes **persistent** delay
+patterns over isolated incidents and connects the strongest findings to
+operational questions that BSAG could investigate.
+
+# Data and methods
+
+## Data
+
+- **Delay snapshots:** one CSV every five minutes, with `trip_id`, `stop_id`,
+  `delay_seconds` (positive = late, negative = early) and `timestamp_fetched`.
+- **Stop and route lookup:** `stop_id`, name, coordinates, route and headsign
+  for every stop on every route. The lookup contains no `trip_id`, so delay
+  rows are joined to it by `stop_id`.
+
+## Processing steps
+
+```{r}
+#| label: tbl-pipeline
+#| tbl-cap: "Rows remaining after each processing step"
+stats |>
+  mutate(count = comma(count)) |>
+  kable(col.names = c("Processing stage", "Count"), align = c("l", "r"))
+```
+
+1. **Exact duplicate rows removed.**
+2. **Extreme values removed** (|delay| > 1 hour), which are more likely feed
+   errors than real delays.
+3. **One observation per trip × stop × date.** A vehicle stays in the feed
+   across many five-minute snapshots, so counting every snapshot would
+   over-count long delays. We keep the **last** snapshot, the best available
+   proxy for the delay when the vehicle passed the stop (checked in @sec-zeros).
+4. **Joined to the stop lookup** by `stop_id`
+   (`r comma(prep$n_unmatched)` observations had no match).
+
+## Definitions
+
+- **Significant delay:** 5 minutes or more behind schedule.
+- **Ranking:** stops and routes are ranked by the *lower bound* of a 95% Wilson
+  confidence interval for the share of significant delays, and only if they
+  have at least `r MIN_TRIPS` observations. This stops places with few trips
+  from topping the list by chance.
+
+# Data quality {#sec-quality}
+
+## Coverage
+
+```{r}
+#| label: fig-coverage
+#| fig-cap: "Trip-stop observations per day. Coverage by day; inspect the first day for partial collection."
+daily_cov <- tu |>
+  group_by(local_date) |>
+  summarise(obs = n(), trips = n_distinct(trip_id), stops = n_distinct(stop_id),
+            .groups = "drop")
+
+ggplot(daily_cov, aes(local_date, obs)) +
+  geom_col(fill = "steelblue") +
+  scale_y_continuous(labels = comma) +
+  labs(x = NULL, y = "Observations")
+```
+
+The daily coverage analysis shows how the number of recorded trip-stop observations varies across the study period. Differences in coverage are important because days with fewer observations may not be directly comparable to days with more complete data. Unusually low observation counts may reflect reduced service, incomplete data collection, or missing records. Therefore, daily delay patterns should be interpreted alongside observation counts to avoid drawing misleading conclusions.
+
+## Missing or unmatched data
+
+```{r}
+#| label: missing
+tibble(
+  Check = c("Observations without a matching stop name",
+            "Observations with missing delay"),
+  Count = c(sum(is.na(tu$stop_name)), sum(is.na(tu$delay_seconds)))
+) |> kable(format.args = list(big.mark = ","))
+```
+
+## Timezone check {#sec-tz}
+
+The feed's timestamps may be stored in UTC or local time. This matters for
+every hour-of-day and weekday result. The panels below are diagnostic only:
+a quiet overnight period does **not** prove a timezone assumption. Verify the
+timestamp convention against the data source or a known timestamp before
+interpreting the hourly patterns.
+
+```{r}
+#| label: fig-tz
+#| fig-cap: "Observations by hour under two assumptions about the timestamps."
+ggplot(tz_counts, aes(hour, n)) +
+  geom_col(fill = "grey40") +
+  facet_wrap(~assumption, ncol = 1) +
+  scale_x_continuous(breaks = 0:23) +
+  scale_y_continuous(labels = comma) +
+  labs(x = "Hour of day", y = "Observations")
+```
+
+::: {.callout-note}
+## Timestamp interpretation
+
+The hourly distribution of observations depends on how the original timestamps are interpreted. Two possible assumptions are examined: timestamps recorded in UTC and converted to Bremen local time, or timestamps already recorded in local time.
+
+The correct interpretation must be verified against the original data source before drawing conclusions about peak-hour delays. Until this is confirmed, the hourly results should be treated as provisional.
+:::
+
+## Exact zeros and the choice of snapshot {#sec-zeros}
+
+```{r}
+#| label: zeros
+zero_tbl <- tibble(
+  Measure = c("Share of observations with delay exactly 0",
+              "Share early (< 0)",
+              "Share 5+ minutes late"),
+  Value = c(pct(100 * mean(tu$delay_seconds == 0)),
+            pct(100 * mean(tu$delay_seconds < 0)),
+            pct(100 * mean(tu$delay_seconds >= LATE_SEC)))
+)
+kable(zero_tbl)
+```
+
+No exact-zero delays were observed in the processed data. The zero-delay diagnostic is retained as a data-quality check, but it does not indicate a zero-delay reporting problem in this sample.
+
+```{r}
+#| label: fig-zeros-hour
+#| fig-cap: "Share of observations with a delay of exactly 0, by hour."
+tu |>
+  group_by(local_hour) |>
+  summarise(share_zero = 100 * mean(delay_seconds == 0), .groups = "drop") |>
+  ggplot(aes(local_hour, share_zero)) +
+  geom_col(fill = "grey50") +
+  scale_x_continuous(breaks = 0:23) +
+  labs(x = "Hour of day", y = "Observations with delay = 0 (%)")
+```
+
+**Does the snapshot rule matter?** We compare keeping the last, the maximum, or
+the mean delay per trip-stop.
+
+```{r}
+#| label: sensitivity-rule
+top_by <- function(col) {
+  tu |>
+    filter(!is.na(stop_name)) |>
+    group_by(stop_id, stop_name) |>
+    summarise(trips = n(), late = sum({{ col }} >= LATE_SEC), .groups = "drop") |>
+    filter(trips >= MIN_TRIPS) |>
+    mutate(ci_low = wilson_lo(late, trips)) |>
+    slice_max(ci_low, n = 10, with_ties = FALSE) |>
+    pull(stop_id)
+}
+top_last <- top_by(delay_last)
+
+tibble(
+  Rule = c("Last snapshot (used)", "Maximum", "Mean"),
+  `% 5+ min late` = c(mean(tu$delay_last >= LATE_SEC),
+                      mean(tu$delay_max  >= LATE_SEC),
+                      mean(tu$delay_mean >= LATE_SEC)) * 100,
+  `Top-10 stops shared with "last"` =
+    c(10, length(intersect(top_last, top_by(delay_max))),
+          length(intersect(top_last, top_by(delay_mean))))
+) |>
+  mutate(`% 5+ min late` = round(`% 5+ min late`, 1)) |>
+  kable()
+```
+
+```{r}
+#| label: snapshot-diagnostics
+tibble(
+  Metric = c("Trip-stop observations seen in more than one snapshot",
+             "Median gap between the maximum and the last delay (min)",
+             "Observations where the maximum is 5+ min above the last"),
+  Value  = c(pct(100 * mean(tu$snapshots > 1)),
+             as.character(round(median(tu$delay_max - tu$delay_last) / 60, 2)),
+             pct(100 * mean(tu$delay_max - tu$delay_last >= LATE_SEC)))
+) |> kable()
+```
+
+**Why the last snapshot.** The vehicle's final reported delay before it leaves
+the feed is the closest available proxy for the delay at the moment it passed
+the stop; earlier snapshots are forecasts made while it was still approaching.
+The tables above show how much the choice matters.
+
+The analysis uses the latest available snapshot for each trip-stop-day observation to avoid counting repeated updates as independent observations. However, delay estimates may change depending on whether the latest or maximum recorded delay is selected. The sensitivity analysis compares these alternatives to assess how much the choice affects the results. The robustness of our conclusions depends on whether the main delay patterns remain consistent under both approaches.
+
+# Overall delay patterns {#sec-patterns}
+
+## How big are the delays?
+
+```{r}
+#| label: tbl-categories
+#| tbl-cap: "Distribution of delays"
+tu |>
+  mutate(category = cut(
+    delay_seconds, breaks = c(-Inf, 0, 1, 300, 600, 900, Inf), right = FALSE,
+    labels = c("Early (< 0 s)", "Exactly 0 s (on schedule or no live data)",
+               "1 s to 5 min late", "5–10 min late",
+               "10–15 min late", "15+ min late"))) |>
+  count(category) |>
+  mutate(share = pct(100 * n / sum(n)), n = comma(n)) |>
+  kable(col.names = c("Category", "Observations", "Share"),
+        align = c("l", "r", "r"))
+```
+
+No observations in this dataset have a delay of exactly 0 seconds, so the corresponding category is absent from this table. The distinction between recorded delays and actual arrival punctuality remains important (see @sec-zeros).
+
+## Time of day {#sec-hour}
+
+```{r}
+#| label: fig-hour
+#| fig-cap: "Share of observations 5+ minutes late by hour of day (shaded band: 95% interval)."
+hour_tbl <- tu |> summarise_delays(local_hour)
+
+ggplot(hour_tbl, aes(local_hour, pct_late)) +
+  geom_ribbon(aes(ymin = ci_low, ymax = ci_high), alpha = 0.2) +
+  geom_line(linewidth = 1) +
+  geom_point() +
+  scale_x_continuous(breaks = 0:23) +
+  labs(x = "Hour of day", y = "Observations 5+ min late (%)")
+```
+
+The hourly analysis examines how the proportion of observations delayed by at least five minutes varies throughout the day. This helps identify periods when Bremen's public transport network experiences greater delays. Hours with very few observations should be interpreted cautiously because their delay percentages may be unstable. The confidence intervals provide additional information about the reliability of these estimates. Recurring periods of elevated delays are particularly important for identifying when operational improvements may be needed.
+
+## Day of the week {#sec-weekday}
+
+```{r}
+#| label: fig-dow
+#| fig-cap: "Share 5+ minutes late by weekday."
+dow_tbl <- tu |> summarise_delays(dow)
+
+ggplot(dow_tbl, aes(dow, pct_late)) +
+  geom_col(fill = "steelblue") +
+  geom_errorbar(aes(ymin = ci_low, ymax = ci_high), width = 0.2) +
+  labs(x = NULL, y = "Observations 5+ min late (%)")
+```
+
+With roughly two weeks of observations (and potentially partial days),
+weekday comparisons are exploratory, not evidence of a stable weekly pattern.
+
+# Problem stops {#sec-stops}
+
+## Ranking
+
+```{r}
+#| label: tbl-top-stops
+#| tbl-cap: "Fifteen stops with the highest lower-bound share of significant delays"
+stop_rank |>
+  slice_head(n = 15) |>
+  transmute(
+    Stop = str_remove(stop_name, "^Bremen "),
+    `stop_id` = stop_id,
+    Observations = comma(trips),
+    `% 5+ min late` = round(pct_late, 1),
+    `95% interval` = sprintf("%.1f–%.1f", ci_low, ci_high),
+    `Median delay (min)` = round(median_delay_min, 1)
+  ) |>
+  kable(align = c("l", "r", "r", "r", "r", "r"))
+```
+
+```{r}
+#| label: fig-top-stops
+#| fig-cap: "Top 15 stops: share of observations 5+ minutes late with 95% interval."
+stop_rank |>
+  slice_head(n = 15) |>
+  mutate(label = str_remove(stop_name, "^Bremen ")) |>
+  ggplot(aes(reorder(label, ci_low), pct_late)) +
+  geom_pointrange(aes(ymin = ci_low, ymax = ci_high)) +
+  coord_flip() +
+  labs(x = NULL, y = "Observations 5+ min late (%)")
+```
+
+## Where are they?
+
+```{r}
+#| label: fig-map
+#| fig-cap: "All ranked stops. Colour = share 5+ minutes late; size = number of observations."
+ggplot(stop_rank, aes(stop_lon, stop_lat, colour = pct_late, size = trips)) +
+  geom_point(alpha = 0.7) +
+  scale_colour_viridis_c(option = "magma", direction = -1,
+                         name = "% 5+ min late") +
+  scale_size_continuous(range = c(0.5, 4), name = "Observations",
+                        labels = comma) +
+  coord_quickmap() +
+  labs(x = "Longitude", y = "Latitude")
+```
+
+## Are the delays persistent?
+
+A stop can rank high because of one bad day. As a persistence measure we count
+the days on which at least `r DAY_CUTOFF`% of trips were 5+ minutes late, using
+only stop-days with at least `r MIN_TRIPS_DAY` trips (with fewer, a single trip
+moves the daily percentage by more than `r round(100 / MIN_TRIPS_DAY, 1)` points).
+
+```{r}
+#| label: tbl-persistent
+#| tbl-cap: "Stops with repeated high-delay days (at least 5 days observed)"
+persistent <- tu |>
+  filter(!is.na(stop_name)) |>
+  group_by(stop_id, stop_name, local_date) |>
+  summarise(trips = n(), pct = 100 * mean(delay_seconds >= LATE_SEC),
+            .groups = "drop") |>
+  filter(trips >= MIN_TRIPS_DAY) |>
+  group_by(stop_id, stop_name) |>
+  summarise(days_observed = n(), bad_days = sum(pct >= DAY_CUTOFF),
+            mean_daily_pct = mean(pct), .groups = "drop") |>
+  filter(days_observed >= 5) |>
+  arrange(desc(bad_days), desc(mean_daily_pct))
+
+# Priority stops are derived from the data, never typed in by hand
+priority_names <- persistent |> distinct(stop_name) |>
+  slice_head(n = N_PRIORITY) |> pull(stop_name)
+PRIORITY_IDS <- stop_lookup |> filter(stop_name %in% priority_names) |>
+  pull(stop_id)
+
+persistent |>
+  slice_head(n = 15) |>
+  mutate(Stop = str_remove(stop_name, "^Bremen "),
+         mean_daily_pct = round(mean_daily_pct, 1)) |>
+  select(Stop, stop_id, days_observed, bad_days, mean_daily_pct) |>
+  kable(col.names = c("Stop", "stop_id", "Days observed",
+                      paste0("Days with ≥", DAY_CUTOFF, "% late"),
+                      "Mean daily % late"))
+```
+
+Priority stops used in the rest of the report (top `r N_PRIORITY` by
+persistence): **`r paste(str_remove(priority_names, "^Bremen "), collapse = ", ")`**.
+
+### How sensitive are the stop lists to our cutoffs? {#sec-sensitivity}
+
+Each cell counts how many of our top-10 stops are *also* in the top 10 under an
+alternative choice (10 = identical list). High numbers mean the conclusions do
+not depend on the arbitrary cutoffs.
+
+```{r}
+#| label: sensitivity-rank
+#| tbl-cap: "Overall ranking: delay threshold × minimum observations"
+THRS <- sort(unique(c(180, LATE_SEC, 600)))
+
+stop_counts <- map(set_names(THRS), \(th) {
+  tu |>
+    filter(!is.na(stop_name)) |>
+    group_by(stop_id) |>
+    summarise(trips = n(), late = sum(delay_seconds >= th), .groups = "drop") |>
+    mutate(ci_low = wilson_lo(late, trips))
+})
+top10_rank <- function(th, min_trips) {
+  stop_counts[[as.character(th)]] |>
+    filter(trips >= min_trips) |>
+    slice_max(ci_low, n = 10, with_ties = FALSE) |>
+    pull(stop_id)
+}
+base_rank <- top10_rank(LATE_SEC, MIN_TRIPS)
+
+expand_grid(threshold = THRS, min_obs = c(100, 200, 500)) |>
+  mutate(shared = map2_int(threshold, min_obs,
+                           \(th, m) length(intersect(base_rank, top10_rank(th, m))))) |>
+  pivot_wider(names_from = min_obs, values_from = shared,
+              names_prefix = "min ") |>
+  mutate(threshold = paste(threshold, "s")) |>
+  kable(col.names = c("Delay threshold", paste("Min", c(100, 200, 500), "obs.")))
+```
+
+```{r}
+#| label: sensitivity-persistence
+#| tbl-cap: "Persistence ranking: minimum trips per day × day cutoff × delay threshold"
+stop_day_by_thr <- map(set_names(THRS), \(th) {
+  tu |>
+    filter(!is.na(stop_name)) |>
+    group_by(stop_id, local_date) |>
+    summarise(trips = n(), pct = 100 * mean(delay_seconds >= th),
+              .groups = "drop")
+})
+top10_persist <- function(th, min_day, cutoff) {
+  stop_day_by_thr[[as.character(th)]] |>
+    filter(trips >= min_day) |>
+    group_by(stop_id) |>
+    summarise(days = n(), bad_days = sum(pct >= cutoff),
+              mean_pct = mean(pct), .groups = "drop") |>
+    filter(days >= 5) |>
+    arrange(desc(bad_days), desc(mean_pct)) |>
+    slice_head(n = 10) |>
+    pull(stop_id)
+}
+base_persist <- top10_persist(LATE_SEC, MIN_TRIPS_DAY, DAY_CUTOFF)
+
+expand_grid(min_day = c(10, 20, 30), cutoff = c(15, 20, 25), th = THRS) |>
+  mutate(shared = pmap_int(list(th, min_day, cutoff),
+                           \(a, b, d) length(intersect(base_persist,
+                                                       top10_persist(a, b, d))))) |>
+  pivot_wider(names_from = th, values_from = shared, names_prefix = "thr ") |>
+  kable(col.names = c("Min trips / day", "Day cutoff (% late)",
+                      paste0("Threshold ", THRS, " s")))
+```
+
+The sensitivity analysis evaluates whether the identification of recurring delay hotspots remains consistent under different thresholds. We compare the top-ranked stops using alternative minimum daily observation counts, delay percentages, and persistence requirements. Stops that remain highly ranked across these settings provide stronger evidence of recurring delays, while stops whose rankings change substantially are considered less robust. This approach helps ensure that our priority locations are not determined solely by arbitrary threshold choices.
+
+## One stop, several IDs
+
+Some physical stops have more than one `stop_id` (different platforms or
+directions). Dohlenstraße is an example.
+
+```{r}
+#| label: dohlen
+lookup |>
+  filter(stop_id %in% PRIORITY_IDS) |>
+  group_by(stop_id, stop_name) |>
+  summarise(lines = paste(sort(unique(route_short_name)), collapse = ", "),
+            .groups = "drop") |>
+  kable(col.names = c("stop_id", "Stop", "Lines serving this ID"))
+```
+
+We report by stop name where the question is "which place is problematic" and
+by `stop_id` where we need to attribute delays to lines.
+
+# Problem routes {#sec-routes}
+
+## Routes at single-line stops
+
+A stop served by several lines cannot be attributed to one route. As a clean
+first view we use only stops served by **one** route.
+
+```{r}
+#| label: fig-routes
+#| fig-cap: "Routes with the highest lower-bound share of significant delays (single-route stops only)."
+route_rank <- tu |>
+  inner_join(single_route_stops, by = "stop_id") |>
+  summarise_delays(route_short_name, route_type) |>
+  filter(trips >= MIN_TRIPS) |>
+  mutate(mode = case_when(route_type == 0 ~ "Tram",
+                          route_type == 3 ~ "Bus", TRUE ~ "Other")) |>
+  arrange(desc(ci_low))
+
+route_rank |>
+  slice_head(n = 15) |>
+  ggplot(aes(reorder(route_short_name, ci_low), pct_late, colour = mode)) +
+  geom_pointrange(aes(ymin = ci_low, ymax = ci_high)) +
+  coord_flip() +
+  labs(x = "Route", y = "Observations 5+ min late (%)", colour = NULL)
+```
+The route-level analysis provides an initial comparison of delay patterns across Bremen's bus and tram lines. However, the results are based only on stops that can be uniquely associated with a single route. Routes with fewer qualifying stops or observations may therefore be underrepresented, making their estimated delay rates less reliable. Consequently, these rankings should be interpreted as indicative rather than definitive measures of route performance. Further analysis using trip-level route information would be necessary to establish more comprehensive and reliable route comparisons.
+
+## Route inferred for every trip (optional) {#sec-inference}
+
+The lookup has no `trip_id`, so a trip's route is not given. We infer it by
+matching the stops each trip visited to the stop set of every route (Jaccard
+similarity). This brings in hubs and multi-line stops that the single-route
+view above drops. Set `RUN_ROUTE_INFERENCE <- TRUE` to run it. The first run is
+slow; the result is cached in `data_processed/trip_route.rds`.
+
+```{r}
+#| label: route-inference
+#| eval: false
+TRIP_ROUTE_CACHE <- "data_processed/trip_route.rds"
+BATCH_SIZE       <- 20000   # trips per batch (keeps memory use moderate)
+MIN_JACCARD      <- 0.5     # minimum similarity to accept a route
+MIN_GAP          <- 0.1     # best route must beat the runner-up by this much
+
+route_stops <- lookup |> distinct(route_id, stop_id)
+route_size  <- route_stops |> count(route_id, name = "route_n")
+
+infer_batch <- function(ts) {
+  trip_n <- ts |> count(trip_id, name = "obs_n")
+  ts |>
+    inner_join(route_stops, by = "stop_id", relationship = "many-to-many") |>
+    count(trip_id, route_id, name = "matched") |>
+    left_join(trip_n,     by = "trip_id") |>
+    left_join(route_size, by = "route_id") |>
+    mutate(jaccard = matched / (obs_n + route_n - matched)) |>
+    group_by(trip_id) |>
+    slice_max(jaccard, n = 2, with_ties = FALSE) |>
+    mutate(rank = row_number(), gap = jaccard - lead(jaccard)) |>
+    ungroup() |>
+    filter(rank == 1) |>
+    mutate(confident = jaccard >= MIN_JACCARD & (is.na(gap) | gap >= MIN_GAP))
+}
+
+if (file.exists(TRIP_ROUTE_CACHE)) {
+  trip_route <- readRDS(TRIP_ROUTE_CACHE)
+} else {
+  trip_stops <- tu |> distinct(trip_id, stop_id)
+  ids        <- unique(trip_stops$trip_id)
+  batches    <- split(ids, ceiling(seq_along(ids) / BATCH_SIZE))
+  trip_route <- map_dfr(batches,
+                        \(b) infer_batch(trip_stops |> filter(trip_id %in% b)))
+  saveRDS(trip_route, TRIP_ROUTE_CACHE)
+}
+
+trip_route |>
+  count(confident) |>
+  mutate(share = pct(100 * n / sum(n)), n = comma(n)) |>
+  kable(col.names = c("Route assigned with confidence", "Trips", "Share"))
+```
+
+Route inference is an optional method and was not executed in this report. Its outputs should not be treated as findings.
+
+```{r}
+#| label: fig-routes-inferred
+#| eval: false
+#| fig-cap: "Routes with the highest lower-bound share of significant delays, using the inferred route of every confidently assigned trip."
+route_names <- lookup |> distinct(route_id, route_short_name, route_type)
+
+inferred_rank <- tu |>
+  inner_join(trip_route |> filter(confident) |> select(trip_id, route_id),
+             by = "trip_id") |>
+  left_join(route_names, by = "route_id") |>
+  summarise_delays(route_short_name, route_type) |>
+  filter(trips >= MIN_TRIPS) |>
+  mutate(mode = case_when(route_type == 0 ~ "Tram",
+                          route_type == 3 ~ "Bus", TRUE ~ "Other")) |>
+  arrange(desc(ci_low))
+
+inferred_rank |>
+  slice_head(n = 15) |>
+  ggplot(aes(reorder(route_short_name, ci_low), pct_late, colour = mode)) +
+  geom_pointrange(aes(ymin = ci_low, ymax = ci_high)) +
+  coord_flip() +
+  labs(x = "Route", y = "Observations 5+ min late (%)", colour = NULL)
+```
+
+**Do the two route views agree?**
+
+```{r}
+#| label: route-agreement
+#| eval: false
+agreement <- inner_join(
+  route_rank    |> transmute(route_short_name, route_type, rank_single = row_number()),
+  inferred_rank |> transmute(route_short_name, route_type, rank_inferred = row_number()),
+  by = c("route_short_name", "route_type"))
+
+tibble(
+  Measure = c("Routes ranked (single-route stops only)",
+              "Routes ranked (inferred routes)",
+              "Routes ranked in both",
+              "Tram routes ranked: single-route / inferred",
+              "Rank correlation between the two (Spearman)"),
+  Value = c(nrow(route_rank), nrow(inferred_rank), nrow(agreement),
+            paste(sum(route_rank$mode == "Tram"), "/", sum(inferred_rank$mode == "Tram")),
+            round(cor(agreement$rank_single, agreement$rank_inferred,
+                      method = "spearman"), 2))
+) |> kable()
+```
+
+The inferred-route comparison was not executed in this report (`eval: false`). No agreement statistics or inferred-route ranking results are reported.
+**Where does delay arise along the line?** With a route for every trip we can
+follow each direction exactly and measure how much delay is *added* between
+consecutive stops, not just how large it is.
+
+```{r}
+#| label: fig-increments
+#| eval: false
+#| fig-cap: "Delay and change in delay from the previous stop, by position along the line (inferred routes, consecutive stops only)."
+line_seq <- lookup |>
+  filter(route_short_name == LINE_FOR_PROFILE) |>
+  distinct(route_id, stop_id, stop_sequence, trip_headsign)
+
+prof <- tu |>
+  inner_join(trip_route |> filter(confident) |> select(trip_id, route_id),
+             by = "trip_id") |>
+  inner_join(line_seq, by = c("route_id", "stop_id")) |>
+  arrange(trip_id, local_date, stop_sequence) |>
+  group_by(trip_id, local_date) |>
+  mutate(step_min = if_else(stop_sequence - lag(stop_sequence) == 1,
+                            (delay_seconds - lag(delay_seconds)) / 60,
+                            NA_real_)) |>
+  ungroup()
+
+prof |>
+  group_by(trip_headsign, stop_sequence) |>
+  summarise(trips = n(),
+            `Mean delay (min)` = mean(delay_seconds) / 60,
+            `Mean change from previous stop (min)` = mean(step_min, na.rm = TRUE),
+            .groups = "drop") |>
+  filter(trips >= 30) |>
+  pivot_longer(starts_with("Mean"), names_to = "measure", values_to = "minutes") |>
+  ggplot(aes(stop_sequence, minutes)) +
+  geom_hline(yintercept = 0, colour = "grey70") +
+  geom_line() + geom_point() +
+  facet_grid(measure ~ trip_headsign, scales = "free_y") +
+  labs(x = "Stop sequence", y = "Minutes", title = paste("Line", LINE_FOR_PROFILE))
+```
+
+The consecutive-stop delay-change analysis was not executed (`eval: false`). Its code is retained as an optional extension; no results from it are interpreted here.
+
+# Case study: Stellfeldsweg (line 61) {#sec-case}
+
+```{r}
+#| label: case-setup
+case <- tu |> filter(stop_id %in% CASE_STOP_IDS)
+case_name <- CASE_STOP_NAME
+case_routes <- lookup |> filter(stop_id %in% CASE_STOP_IDS) |>
+  pull(route_short_name) |> unique() |> sort() |> paste(collapse = ", ")
+```
+
+**`r str_remove(case_name, "^Bremen ")`** (`stop_id` `r paste(CASE_STOP_IDS, collapse = ", ")`) is served
+by line(s) **`r case_routes`**. `r ifelse(length(strsplit(case_routes, ", ")[[1]]) == 1, "It is a clean, single-line stop, which keeps the interpretation simple.", "It is served by several lines, so line-level conclusions need care.")`
+It is `r ifelse(CASE_STOP_NAME %in% priority_names, "one of", "not among")` the top `r N_PRIORITY` persistent stops (@sec-stops).
+
+## Daily pattern {#sec-case-daily}
+
+```{r}
+#| label: fig-case-daily
+#| fig-cap: "Daily share 5+ minutes late at the case-study stop. Point size = number of trips; dashed line = split date."
+case_daily <- case |>
+  group_by(local_date) |>
+  summarise(trips = n(), pct_late = 100 * mean(delay_seconds >= LATE_SEC),
+            mean_delay_min = mean(delay_seconds) / 60, .groups = "drop")
+
+ggplot(case_daily, aes(local_date, pct_late)) +
+  geom_line(colour = "grey60") +
+  geom_point(aes(size = trips), colour = "firebrick") +
+  geom_vline(xintercept = SPLIT_DATE, linetype = "dashed") +
+  scale_size_continuous(name = "Trips", range = c(1, 5)) +
+  labs(x = NULL, y = "Trips 5+ min late (%)")
+```
+
+```{r}
+#| label: case-daily-table
+case_daily |>
+  mutate(pct_late = round(pct_late, 1), mean_delay_min = round(mean_delay_min, 1)) |>
+  kable(col.names = c("Date", "Trips", "% 5+ min late", "Mean delay (min)"))
+```
+
+With few trips per day, a handful of late trips moves the percentage a lot:
+read the point sizes before reading the line.
+
+## Before and after `r format(SPLIT_DATE, "%d %b")`: local change or network-wide?
+
+We compare weekdays before and after the split date, for the case-study stop
+and, as a control, for all other stops.
+
+```{r}
+#| label: tbl-before-after
+#| tbl-cap: "Weekday delay before vs after the split date: case-study stop versus all other stops"
+ba <- function(df, label) {
+  df |>
+    filter(wday(local_date, week_start = 1) <= 5) |>
+    mutate(period = if_else(local_date < SPLIT_DATE, "Before", "After")) |>
+    summarise_delays(period) |>
+    mutate(group = label)
+}
+bind_rows(ba(case, "Case-study stop"),
+          ba(tu |> filter(!(stop_id %in% CASE_STOP_IDS)), "All other stops")) |>
+  transmute(Group = group, Period = period, Observations = comma(trips),
+            `% 5+ min late` = round(pct_late, 1),
+            `95% interval` = sprintf("%.1f–%.1f", ci_low, ci_high),
+            `Mean delay (min)` = round(mean_delay_min, 1)) |>
+  kable()
+```
+
+::: {.callout-note}
+The comparison between Stellfeldsweg and the wider Bremen transit network helps assess whether the observed changes in delays are specific to this location or reflect a broader pattern. However, the interpretation must also consider differences in observation counts and uncertainty between the comparison periods. A decline in recorded delays does not necessarily indicate improved service, particularly if the number of observations also decreases substantially. Therefore, the findings should be treated as descriptive rather than causal, and further investigation is needed to determine whether changes in service patterns, timetable arrangements, or data coverage contributed to the observed differences.
+:::
+
+## Did the timetable change? (trip-ID check) {#sec-schedule-check}
+
+If the timetable did not change, the `trip_id`s running on a given day type
+(Mon–Fri, Sat, Sun) should already have appeared earlier on the same day type.
+A jump in "new" trip IDs on a later date suggests a new schedule version. The
+first Tuesday, Saturday and Sunday in the data are 100% new by construction,
+so those bars say nothing.
+
+```{r}
+#| label: fig-schedule
+#| fig-cap: "Share of the day's trip IDs not seen before on the same day type."
+day_type <- function(d) {
+  case_when(wday(d, week_start = 1) <= 5 ~ "Mon-Fri",
+            wday(d, week_start = 1) == 6 ~ "Sat", TRUE ~ "Sun")
+}
+schedule_check_for <- function(df) {
+  df |>
+    distinct(local_date, trip_id) |>
+    mutate(daytype = day_type(local_date)) |>
+    group_by(daytype, trip_id) |>
+    mutate(first_date = min(local_date)) |>
+    ungroup() |>
+    group_by(local_date, daytype) |>
+    summarise(trips = n(), pct_new = 100 * mean(first_date == local_date),
+              .groups = "drop")
+}
+
+bind_rows(schedule_check_for(tu)   |> mutate(scope = "Whole network"),
+          schedule_check_for(case) |> mutate(scope = "Case-study stop")) |>
+  ggplot(aes(local_date, pct_new, fill = daytype)) +
+  geom_col() +
+  facet_wrap(~scope, ncol = 1) +
+  labs(x = NULL, y = "New trip IDs (%)", fill = "Day type")
+```
+
+The trip-ID analysis examines whether the observed services remain consistent throughout the study period. A low percentage of newly appearing trip IDs after the initial observation period would suggest relative stability in the recorded service patterns. In contrast, a substantial increase in new trip IDs could indicate changes in scheduled services, trip identifiers, or data coverage. However, changes in trip IDs alone do not confirm a timetable revision. Therefore, the results should be interpreted alongside the number of recorded observations and any independently verified timetable information.
+
+## The three priority stops compared
+
+```{r}
+#| label: fig-priority
+#| fig-cap: "Daily share 5+ minutes late at the priority stops (one panel per stop_id)."
+labels <- lookup |>
+  filter(stop_id %in% PRIORITY_IDS) |>
+  group_by(stop_id, stop_name) |>
+  summarise(lines = paste(sort(unique(route_short_name)), collapse = ", "),
+            .groups = "drop") |>
+  mutate(panel = paste0(str_remove(stop_name, "^Bremen "), " (", lines, ")"))
+
+tu |>
+  filter(stop_id %in% PRIORITY_IDS) |>
+  group_by(stop_id, local_date) |>
+  summarise(trips = n(), pct_late = 100 * mean(delay_seconds >= LATE_SEC),
+            .groups = "drop") |>
+  left_join(labels, by = "stop_id") |>
+  ggplot(aes(local_date, pct_late)) +
+  geom_line(colour = "grey60") +
+  geom_point(aes(size = trips), colour = "firebrick") +
+  geom_vline(xintercept = SPLIT_DATE, linetype = "dashed") +
+  facet_wrap(~panel, ncol = 1) +
+  labs(x = NULL, y = "Trips 5+ min late (%)", size = "Trips")
+```
+
+
+# Extended Analysis of Recurring Delay Patterns
+
+This section provides a more detailed examination of recurring delay patterns across Bremen's public transport network. The analysis considers daily variations, afternoon peak periods, persistence at frequently delayed stops, route coverage, and the influence of repeated real-time observations.
+
+To ensure consistency, all analyses use the cleaned and deduplicated dataset, retaining the latest available observation for each trip–stop–date combination. This approach reduces the risk of counting repeated snapshots as independent observations and allows comparisons across locations and time periods.
+
+## Daily network-wide delay pattern
+
+```{r}
+#| label: fig-network-daily
+#| fig-cap: "Daily share of trip-stop observations delayed at least five minutes; labels show sample size."
+network_daily <- tu |>
+  summarise_delays(local_date) |>
+  arrange(local_date)
+
+ggplot(network_daily, aes(local_date, pct_late)) +
+  geom_line(linewidth = 0.8, colour = "steelblue") +
+  geom_point(aes(size = trips), colour = "steelblue") +
+  geom_errorbar(aes(ymin = ci_low, ymax = ci_high), width = 0.15) +
+  scale_size_continuous(labels = scales::comma) +
+  labs(x = "Date", y = "Observations 5+ minutes late (%)",
+       size = "Observations")
+```
+
+```{r}
+#| label: tbl-network-daily
+#| tbl-cap: "Daily network-wide delay rate and observation coverage"
+network_daily |>
+  transmute(Date = local_date, Observations = comma(trips),
+            `5+ min late (%)` = round(pct_late, 1),
+            `Median delay (min)` = round(median_delay_min, 2)) |>
+  kable()
+```
+
+The daily analysis reveals variation in the proportion of observations delayed by at least five minutes. The highest recorded delay rate occurred on 20 August (15.6%), while the lowest was observed on 23 August (5.7%).
+
+However, these differences should be interpreted alongside changes in data coverage. Observation counts were relatively stable between 18 and 21 August, while fewer observations were recorded during the weekend. The first day, 17 August, had particularly limited coverage and is therefore not directly comparable with the other dates.
+
+Overall, the results suggest that delays were more frequent on certain days, but the analysis does not establish why these differences occurred. Factors such as service schedules, traffic conditions, and changes in the number of recorded observations may have influenced the results.
+
+## Afternoon peak: recurring stop-level problems
+
+This follows the exploratory script's 15:00–17:59 analysis, but avoids
+snapshot-weighting and ranks well-observed stops using Wilson lower bounds.
+
+```{r}
+#| label: tbl-afternoon-stops
+#| tbl-cap: "Top 15 delayed stops in the afternoon (15:00–17:59)"
+afternoon_rank <- tu |>
+  filter(local_hour %in% 15:17, !is.na(stop_name)) |>
+  summarise_delays(stop_id, stop_name) |>
+  filter(trips >= 100) |>
+  arrange(desc(ci_low))
+
+afternoon_rank |>
+  slice_head(n = 15) |>
+  transmute(Stop = str_remove(stop_name, "^Bremen "),
+            Observations = comma(trips),
+            `5+ min late (%)` = round(pct_late, 1),
+            `95% interval` = sprintf("%.1f–%.1f", ci_low, ci_high)) |>
+  kable()
+```
+
+```{r}
+#| label: fig-afternoon-stops
+#| fig-cap: "Afternoon stop ranking, with 95% Wilson intervals; at least 100 trip-stop observations per stop."
+afternoon_rank |>
+  slice_head(n = 12) |>
+  mutate(Stop = str_remove(stop_name, "^Bremen ")) |>
+  ggplot(aes(reorder(Stop, ci_low), pct_late)) +
+  geom_pointrange(aes(ymin = ci_low, ymax = ci_high)) +
+  coord_flip() +
+  labs(x = NULL, y = "Afternoon observations 5+ minutes late (%)")
+```
+
+## Are the top stops also persistent?
+
+A high overall delay rate does not necessarily imply repeated bad days.
+We compare the top stops by overall delay rate with their persistence
+statistics using a unique stop ID, not a potentially ambiguous name. Stellfeldsweg is a case-study priority because it ranks highly overall and has repeated bad days; it is not one of the three highest-ranked stops under the separate persistence ranking.
+
+```{r}
+#| label: tbl-rank-persistence-crosscheck
+#| tbl-cap: "Overall top stops cross-checked against daily persistence"
+stop_rank |>
+  slice_head(n = 15) |>
+  select(stop_id, stop_name, trips, pct_late) |>
+  left_join(persistent |>
+              select(stop_id, days_observed, bad_days, mean_daily_pct),
+            by = "stop_id") |>
+  transmute(Stop = str_remove(stop_name, "^Bremen "),
+            `Stop ID` = stop_id, Observations = comma(trips),
+            `Overall 5+ min late (%)` = round(pct_late, 1),
+            `Days observed` = days_observed,
+            `Bad days` = bad_days,
+            `Mean daily late (%)` = round(mean_daily_pct, 1)) |>
+  kable()
+```
+
+An `NA` in the persistence columns means that the stop did not meet the eligibility threshold of at least five days with 20 or more observations per day; it does not mean zero delayed days. This affects Roland-Center, Bahnhof Schönebeck, Am Heiddamm and Arsterdamm.
+
+## Which lines serve the priority stops?
+
+A route appearing in the lookup for a stop does **not** prove that every
+delay at that stop was caused by that route. This table documents route
+coverage without assigning individual trips to routes.
+
+```{r}
+#| label: tbl-priority-route-coverage
+#| tbl-cap: "Lines serving each priority stop ID (descriptive only)"
+lookup |>
+  filter(stop_id %in% PRIORITY_IDS) |>
+  distinct(stop_id, stop_name, route_short_name, route_type) |>
+  mutate(Mode = case_when(route_type == 0 ~ "Tram",
+                          route_type == 3 ~ "Bus",
+                          TRUE ~ "Other")) |>
+  arrange(stop_name, stop_id, route_short_name) |>
+  transmute(Stop = stop_name, `Stop ID` = stop_id,
+            Line = route_short_name, Mode) |>
+  kable()
+```
+
+## How much do repeated snapshots affect the data?
+
+```{r}
+#| label: tbl-snapshot-weight
+#| tbl-cap: "Number of repeated snapshots per unique trip-stop-date record"
+tu |>
+  summarise(`Unique trip-stop-date records` = comma(n()),
+            `Records with multiple snapshots` = comma(sum(snapshots > 1)),
+            `Share with multiple snapshots (%)` = round(100 * mean(snapshots > 1), 1),
+            `Median snapshots per record` = median(snapshots),
+            `Maximum snapshots per record` = max(snapshots)) |>
+  kable()
+```
+
+## Comparison windows: the Stellfeldsweg case
+
+The exploratory script compared 18–21 August with 24–28 August.
+These windows contain **different numbers of weekdays**, so differences
+must not be interpreted as a controlled before/after experiment.
+
+```{r}
+#| label: tbl-stellfeld-windows
+#| tbl-cap: "Exploratory comparison of two unequal weekday windows at Stellfeldsweg"
+case |>
+  mutate(Window = case_when(
+    local_date >= as.Date("2026-08-18") &
+      local_date <= as.Date("2026-08-21") ~ "18–21 August (4 weekdays)",
+    local_date >= as.Date("2026-08-24") &
+      local_date <= as.Date("2026-08-28") ~ "24–28 August (5 weekdays)",
+    TRUE ~ NA_character_)) |>
+  filter(!is.na(Window)) |>
+  summarise_delays(Window) |>
+  transmute(Window, Observations = comma(trips),
+            `5+ min late (%)` = round(pct_late, 1),
+            `Mean delay (min)` = round(mean_delay_min, 2),
+            `Median delay (min)` = round(median_delay_min, 2)) |>
+  kable()
+```
+
+## Interpreting the evidence
+
+The findings should distinguish three questions: **where** the delay is
+observed, **when** it recurs, and **what independently verified event or
+operational constraint** could explain it. The transit feed directly
+addresses the first two; the third requires external corroboration.
+
+# Possible causes {#sec-causes}
+
+The feed tells us *where and when* reported delays occur, not *why*. We therefore treat
+causes as hypotheses and test each against the data or external sources.
+
+## Hypotheses
+
+| # | Hypothesis | What we would expect to see | Where tested | Status |
+|---|-----------|-----------------------------|--------------|--------|
+| H1 | Holiday timetable or summer roadworks | Delays differ from regular service | External evidence (@sec-external) | Unverified; requires dated official sources |
+| H2 | Timetable change inside the window | New `trip_id`s on a given date; local change vs control | @sec-schedule-check and the before/after table | Inconclusive; trip-ID changes do not confirm a timetable revision |
+| H3 | Peak-hour congestion | Delay rises in the morning and afternoon peaks | @sec-hour | Temporal patterns examined; congestion not verified |
+| H4 | Delay builds up along the line | Mean delay increases with stop sequence | @sec-profile | Exploratory analysis; delay accumulation not confirmed |
+| H5 | Low frequency makes the share unstable | Few trips per day, wide intervals | @sec-case-daily | Supported as a data coverage concern |
+| H6 | Feed artefacts (zeros, gaps, timezone) | Zeros concentrated at certain hours or days | @sec-tz, @sec-zeros | Partially assessed; timestamps require verification |
+| H7 | Local roadworks or incident near a stop | Delay jump at one stop on specific dates | External sources | Unverified; requires independent evidence |
+
+## External evidence {#sec-external}
+
+- Holiday timetables and construction diversions are possible contextual
+  explanations, but their dates and relevance to the study period have not
+  been independently established here. The transit observations alone
+  cannot attribute the reported delays to these causes.
+- We did not find a notice about roadworks or a timetable change at the
+  priority stops around 22 August. Absence of evidence in our search is not
+  evidence of absence.
+
+::: {.callout-note}
+To investigate potential explanations for recurring delays, we consider official BSAG service announcements, timetable changes, and Bremen roadworks information relevant to the study period (17–31 August 2026). These sources can help establish whether disruptions coincide with the locations and dates identified in our analysis. However, a temporal or geographical association alone does not establish causation. Any proposed explanation must be supported by verifiable evidence before being presented as a finding.
+:::
+
+## Does delay build up along the line? {#sec-profile}
+
+This is an exploratory stop-sequence profile, **not** a direct measurement
+of delay gained between successive stops. Shared stop IDs or multiple route
+directions can make the attribution ambiguous.
+
+```{r}
+#| label: fig-profile
+#| fig-cap: "Mean delay by position along the line (stops served only by this line; one panel per direction)."
+line_stops <- lookup |>
+  filter(route_short_name == LINE_FOR_PROFILE) |>
+  distinct(stop_id, stop_name, stop_sequence, trip_headsign) |>
+  semi_join(single_route_stops, by = "stop_id")
+
+tu |>
+  inner_join(line_stops, by = c("stop_id"), suffix = c("", ".l")) |>
+  group_by(trip_headsign, stop_sequence) |>
+  summarise(trips = n(), mean_delay_min = mean(delay_seconds) / 60,
+            .groups = "drop") |>
+  filter(trips >= 30) |>
+  ggplot(aes(stop_sequence, mean_delay_min)) +
+  geom_line() + geom_point(aes(size = trips)) +
+  facet_wrap(~trip_headsign, ncol = 1) +
+  labs(x = "Stop sequence", y = "Mean delay (min)", size = "Trips",
+       title = paste("Line", LINE_FOR_PROFILE))
+```
+
+A steady rise may be consistent with delay accumulating along a route, but
+it does not by itself establish a cause. Only stops served
+exclusively by this line are used, so the picture may have gaps. Where a
+`stop_id` is shared by both directions, its delays appear in both panels.
+
+The stop-sequence analysis examines whether delays increase as vehicles progress along a route. Comparing mean delays across successive stops can reveal potential patterns of delay accumulation. However, because some stops serve multiple routes or directions, these results should be interpreted cautiously. The analysis provides an exploratory indication of where delays may accumulate rather than definitive evidence of where they originate.
+
+# Recommendations
+
+Our analysis identifies recurring delay hotspots and differences in data coverage across Bremen's public transport network. Based on these findings, we propose three targeted actions for BSAG. These recommendations focus on investigating persistent problems, improving service reliability, and strengthening data quality.
+
+| Problem identified | Recommendation | Responsible party | Expected benefit | Feasibility |
+|---|---|---|---|---|
+| Recurring delays at Stellfeldsweg (a high-ranked case study, but not a top-three persistence stop) and other priority stops | Conduct targeted operational reviews of frequently delayed stops, including scheduled running times, stopping conditions, and traffic interactions. | BSAG | Identify operational bottlenecks and possible timetable adjustments. | Medium — requires operational investigation. |
+| High delay rates at several stops, including Dohlenstraße | Monitor recurring delays by stop, hour, and day using a regular performance dashboard. Prioritize stops with sufficient observations and persistent delays. | BSAG | Earlier identification of recurring reliability problems and better targeting of interventions. | High — builds on existing real-time data. |
+| Sharp reduction in recorded observations at Stellfeldsweg after 22 August | Investigate whether the change reflects service frequency, route changes, trip identifiers, or missing real-time data. Establish automated coverage checks. | BSAG / data management team | More reliable monitoring and fewer misleading conclusions about service improvements. | High to medium — depends on data access and system integration. |
+
+The recommendations are based on three main findings from the analysis. First, recurring delays at stops such as Stellfeldsweg and Dohlenstraße (ranked using different overall and persistence criteria) suggest that BSAG should prioritize targeted operational investigations and regular monitoring of these locations. Second, variations in delay rates across dates and hours indicate the importance of monitoring service reliability while accounting for differences in observation counts. Third, the sharp reduction in observations at Stellfeldsweg after 22 August highlights the need to distinguish actual improvements in punctuality from changes in data coverage.
+
+These recommendations should be understood as priorities for further investigation rather than confirmed solutions to identified operational problems. Before implementing timetable adjustments or infrastructure changes, BSAG should validate the observed patterns using additional operational data, longer observation periods, and independent evidence of possible disruptions.
+
+# Limitations
+
+- **Short observation period:** The analysis covers only 17–31 August 2026. This limits our ability to identify long-term patterns or generalize the findings to other seasons.
+
+- **Snapshot-based observations:** The analysis retains the latest snapshot for each trip–stop–date combination. However, these observations may not represent actual vehicle arrival times.
+
+- **Estimated rather than observed delays:** The GTFS real-time feed provides delay estimates, which may differ from independently measured arrival delays. Although no exact-zero delays occur in the processed observations, missing or incomplete real-time information remains a possible limitation.
+
+- **Route attribution:** Some stops are served by multiple routes, and the available lookup data do not always permit reliable assignment of delays to specific lines.
+
+- **Uneven data coverage:** Observation counts vary across dates and stops. At Stellfeldsweg, the sharp reduction in recorded observations after 22 August makes before-and-after comparisons particularly uncertain.
+
+- **Timestamp interpretation:** The timezone convention has not yet been independently verified. Therefore, conclusions about the precise timing of hourly delay patterns should be treated as provisional.
+
+- **No causal identification:** The data do not directly establish whether congestion, roadworks, timetable changes, or operational incidents caused the observed delays. Additional operational records and independent evidence would be required.
+
+# Reproducibility {.unnumbered}
+
+The analysis was conducted in R using Quarto for report generation. Reproducing the analysis requires the source snapshots, lookup file, R dependencies, and the folder paths configured in this QMD.
+
+The analysis uses GTFS real-time CSV snapshots collected between 17 and 31 August 2026, together with the accompanying stop and route lookup information. During preprocessing, duplicate records and implausible delay values are removed, and the latest available snapshot is retained for each trip–stop–date combination.
+
+The processed dataset is used consistently throughout the analysis to produce the summary statistics, tables, and visualizations. The R session information is provided below to document the computational environment.
+
+The raw snapshot files are not included in the GitHub repository because of their size. Consequently, full reproduction requires access to the original data files and the folder layout and file paths specified in the QMD configuration.
+
+```{r}
+#| label: session
+sessionInfo()
+```
+
+# References {.unnumbered}
+
+This study uses Bremen public transport GTFS real-time data collected between 17 and 31 August 2026. The analysis also uses the accompanying stop and route lookup information to identify locations and examine patterns in reported delays.
+
+The GTFS real-time snapshots (17–31 August 2026) and accompanying `bremen_lookup.csv` constitute the primary data sources for this study. General information about GTFS real-time data is available from [GTFS.de](https://gtfs.de/de/realtime/). Official BSAG service announcements, timetable information, and Bremen roadworks notices are potential sources for validating explanations of observed delays. However, no specific external disruption has been independently verified in this report. Therefore, possible operational causes are discussed as hypotheses rather than established findings.

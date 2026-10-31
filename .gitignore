@@ -1,0 +1,11 @@
+# Raw five-minute snapshots: too large for the repository
+update_data/
+
+# Cache created when the report is rendered
+data_processed/
+
+# Quarto and R temporary files
+.quarto/
+.Rhistory
+.RData
+.Rproj.user/
